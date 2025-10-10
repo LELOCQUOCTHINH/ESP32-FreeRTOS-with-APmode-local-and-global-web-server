@@ -1,0 +1,18 @@
+# ESP-IDF Build Output
+# This directory contains all the compiled files and the final binary.
+/build
+
+# Final binary, map, and ELF files if they are somehow outside the build directory
+*.bin
+*.map
+*.elf
+
+# SDK configuration backup files created by menuconfig
+/sdkconfig.old
+/sdkconfig.bak
+
+# VS Code specific settings (optional, but recommended for team projects)
+.vscode/
+
+# This file is generated on Windows and should not be committed
+/project.emproject
