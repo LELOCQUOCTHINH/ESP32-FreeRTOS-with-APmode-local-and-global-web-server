@@ -2,6 +2,14 @@
 
 This component provides a professional, production-ready **WiFi Provisioning** solution for ESP32 devices. It implements a captive portal mechanism using SoftAP and an embedded Web Server to allow users to configure WiFi credentials dynamically.
 
+<div align="center">
+
+<img width="516" alt="APMode Web Interface" src="https://github.com/user-attachments/assets/d81fff97-5068-4b04-859e-05bb281beead" />
+
+*UI for config wifi in APmode*
+
+</div>
+
 ## Features
 
 - **Smart Auto-Reconnection**: Automatically attempts to connect to the last known WiFi network stored in NVS (Non-Volatile Storage) upon boot.
