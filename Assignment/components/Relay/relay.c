@@ -8,7 +8,7 @@ static const char *TAG = "Relay";
    For a more robust solution, a linked list or hash map could be used, 
    but arrays are faster and simpler for embedded. 
 */
-#define MAX_RELAYS 1
+#define MAX_RELAYS 2
 
 typedef struct {
     gpio_num_t gpio_num;

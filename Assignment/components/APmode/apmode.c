@@ -15,7 +15,7 @@
 #define AP_SSID "ESP32_Config_Wifi"
 #define AP_PASS "12345678"
 #define MAX_RETRY_COUNT 10
-#define RECONNECT_INTERVAL_MS (60 * 1000) // 1 phút check lại mạng 1 lần
+#define RECONNECT_INTERVAL_MS (60 * 1000) // Check one time for each one minute
 
 static const char *TAG = "WiFiManager";
 
