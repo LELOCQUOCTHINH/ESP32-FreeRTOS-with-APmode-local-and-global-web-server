@@ -1,4 +1,4 @@
-idf_component_register(SRCS "apmode.c"
+idf_component_register(SRCS "APmode.c"
                        PRIV_REQUIRES esp_wifi nvs_flash wifi_provisioning
                        INCLUDE_DIRS "include"
                        EMBED_TXTFILES "index.html"

@@ -15,6 +15,7 @@
 #define AP_SSID "ESP32_Config_Wifi"
 #define AP_PASS "12345678"
 #define MAX_RETRY_COUNT 10
+#define RECONNECT_INTERVAL_MS (60 * 1000) // 1 phút check lại mạng 1 lần
 
 static const char *TAG = "WiFiManager";
 
@@ -44,10 +45,17 @@ static char s_temp_pass[65] = {0};
 /* NEW: Flags for Logic Control */
 static bool s_is_provisioning = false; // True = AP Mode, False = Normal STA Mode
 static int s_retry_num = 0;
+static httpd_handle_t s_server = NULL; // Keep track of server handle
+static TimerHandle_t s_reconnect_timer = NULL;
+static TaskHandle_t s_reconnect_task_handle = NULL;
 
 /* --- Function Prototypes --- */
 void start_provisioning_mode(void);
 void start_normal_mode(char *ssid, char *pass);
+static httpd_handle_t start_webserver(void);
+static void stop_webserver(httpd_handle_t server);
+static void reconnect_timer_callback(TimerHandle_t xTimer);
+esp_err_t load_wifi_credentials(char *ssid, char *pass, size_t max_len);
 
 /* --- NVS Helper Functions --- */
 esp_err_t save_wifi_credentials(const char *ssid, const char *pass) {
@@ -77,14 +85,54 @@ esp_err_t load_wifi_credentials(char *ssid, char *pass, size_t max_len) {
     return err;
 }
 
+/* --- Task: Background Reconnect --- */
+static void reconnect_task(void *pvParameter) {
+    char ssid[33] = {0};
+    char pass[65] = {0};
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (s_is_provisioning) {
+            ESP_LOGI(TAG, "Auto-reconnect Task: Checking saved WiFi...");
+            if (load_wifi_credentials(ssid, pass, sizeof(ssid)) == ESP_OK) {
+                ESP_LOGI(TAG, "Found saved WiFi '%s'. Attempting background connection...", ssid);
+                
+                wifi_config_t sta_config = {0};
+                strcpy((char *)sta_config.sta.ssid, ssid);
+                strcpy((char *)sta_config.sta.password, pass);
+                
+                /* Important: APSTA mode allows concurrent STA connection attempts */
+                esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+                esp_wifi_connect();
+            }
+        }
+    }
+}
+
+static void reconnect_timer_callback(TimerHandle_t xTimer) {
+    if (s_is_provisioning && s_reconnect_task_handle != NULL) {
+        xTaskNotifyGive(s_reconnect_task_handle);
+    }
+}
+
 /* --- Task: Switch to STA Mode --- */
 static void switch_to_sta_task(void *pvParameter) {
     vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "Saved. Rebooting to apply new settings...");
-    esp_restart(); // Reboot ensures a clean state for Normal Mode
+    ESP_LOGI(TAG, "Credentials saved. Switching to Station Mode (No Reboot)...");
+    
+    /* Load credentials we just saved (or use s_temp_*) */
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    load_wifi_credentials(ssid, pass, sizeof(ssid));
+    
+    /* Transition to Normal Mode */
+    start_normal_mode(ssid, pass);
+    
+    vTaskDelete(NULL);
 }
 
-/* --- Event Handler (CRITICAL FIX) --- */
+/* --- Event Handler --- */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
@@ -110,6 +158,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                 }
                 esp_wifi_disconnect();
             }
+            /* If background reconnect failed -> Do nothing, stay in AP mode */
+            else {
+                ESP_LOGW(TAG, "Background reconnect failed. Still in AP Mode.");
+            }
         } 
         /* LOGIC B: If we are in Normal Mode (Startup attempt) */
         else {
@@ -131,6 +183,14 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         s_connect_status = WIFI_STATUS_CONNECTED;
         s_retry_num = 0; // Reset retry counter on success
         ESP_LOGI(TAG, "Got IP: %s", s_connected_ip);
+
+        /* LOGIC: If we got IP while in Provisioning Mode -> It means success! */
+        if (s_is_provisioning) {
+             ESP_LOGI(TAG, "Connection Successful! Switching to Normal Mode...");
+             
+             /* FIX: Increased Stack Size to 4096 to prevent Stack Overflow */
+             xTaskCreate(switch_to_sta_task, "switch_sta", 4096, NULL, 5, NULL);
+        }
     }
 }
 
@@ -226,7 +286,7 @@ static esp_err_t save_handler(httpd_req_t *req) {
     if (save_wifi_credentials(s_temp_ssid, s_temp_pass) == ESP_OK) {
         httpd_resp_set_hdr(req, "Connection", "close");
         httpd_resp_send(req, "Saved", HTTPD_RESP_USE_STRLEN);
-        xTaskCreate(switch_to_sta_task, "switch_sta", 2048, NULL, 5, NULL);
+        xTaskCreate(switch_to_sta_task, "switch_sta", 4096, NULL, 5, NULL);
     } else {
         httpd_resp_send_500(req);
     }
@@ -234,11 +294,12 @@ static esp_err_t save_handler(httpd_req_t *req) {
 }
 
 static httpd_handle_t start_webserver(void) {
+    if (s_server != NULL) return s_server; // Already started
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 12;
-    httpd_handle_t server = NULL;
+    // httpd_handle_t server = NULL;
 
-    if (httpd_start(&server, &config) == ESP_OK) {
+    if (httpd_start(&s_server, &config) == ESP_OK) {
         httpd_uri_t uris[] = {
             { "/", HTTP_GET, root_handler, NULL },
             { "/favicon.ico", HTTP_GET, favicon_handler, NULL },
@@ -249,12 +310,20 @@ static httpd_handle_t start_webserver(void) {
             { "/save", HTTP_POST, save_handler, NULL }
         };
         for (int i = 0; i < sizeof(uris)/sizeof(httpd_uri_t); i++) {
-            httpd_register_uri_handler(server, &uris[i]);
+            httpd_register_uri_handler(s_server, &uris[i]);
         }
         ESP_LOGI(TAG, "Web Server Started");
-        return server;
+        return s_server;
     }
     return NULL;
+}
+
+static void stop_webserver(httpd_handle_t server) {
+    if (server) {
+        httpd_stop(server);
+        s_server = NULL;
+        ESP_LOGI(TAG, "Web Server Stopped");
+    }
 }
 
 /* --- MODE 1: Provisioning Mode (APSTA + WebServer) --- */
@@ -283,6 +352,16 @@ void start_provisioning_mode(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
     
     start_webserver();
+
+    /* START RECONNECT MECHANISM (Timer + Task) */
+    if (s_reconnect_task_handle == NULL) {
+        xTaskCreate(reconnect_task, "reconnect_task", 4096, NULL, 5, &s_reconnect_task_handle);
+    }
+    if (s_reconnect_timer == NULL) {
+        s_reconnect_timer = xTimerCreate("reconnect_tmr", pdMS_TO_TICKS(RECONNECT_INTERVAL_MS), pdTRUE, NULL, reconnect_timer_callback);
+    }
+    if (s_reconnect_timer) xTimerStart(s_reconnect_timer, 0);
+
     ESP_LOGI(TAG, "AP Started. Connect to: '%s', password: '%s", AP_SSID, AP_PASS);
 }
 
@@ -291,7 +370,13 @@ void start_normal_mode(char *ssid, char *pass) {
     ESP_LOGI(TAG, "Starting NORMAL MODE (STA)...");
     s_is_provisioning = false; // FLAG: We are in Normal Mode
 
-    /* In Normal mode, we don't need AP, so just STA */
+    /* 1. Stop Web Server (Free up RAM) */
+    stop_webserver(s_server);
+
+    /* 2. Stop WiFi to clear AP config */
+    esp_wifi_stop();
+    
+    /* 3. Re-init for STA only */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
 
@@ -308,17 +393,29 @@ void start_normal_mode(char *ssid, char *pass) {
 }
 
 void apmode_init(void) {
+   /* 1. Initialize NVS (Safe Check) */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
     }
     
-    /* Global Init */
+    /* 2. Initialize Netif & Loop (Safe Check) */
+    /* esp_netif_init() internally checks if already init, safe to call multiple times */
     esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
+    /* esp_event_loop_create_default() returns ERR_INVALID_STATE if already created, we can ignore that error */
+    esp_err_t loop_err = esp_event_loop_create_default();
+    if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Event Loop init warning: %s", esp_err_to_name(loop_err));
+    }
+    
+    /* 3. Create Interfaces ONLY if they don't exist */
+    if (esp_netif_get_handle_from_ifkey("WIFI_AP_DEF") == NULL) {
+        esp_netif_create_default_wifi_ap();
+    }
+    if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
+        esp_netif_create_default_wifi_sta();
+    }
     
     /* Register Event Handler ONCE here */
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
