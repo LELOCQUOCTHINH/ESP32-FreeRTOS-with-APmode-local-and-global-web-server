@@ -87,6 +87,9 @@ static void system_event_handler(void* arg, esp_event_base_t event_base,
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         is_wifi_connected = false;
         ESP_LOGW(TAG, "WiFi Lost.");
+
+        /* NEW: Reset flag để khi có mạng lại, nó biết phải bật lại services */
+        is_stamode_services_started = false;
     }
 }
 

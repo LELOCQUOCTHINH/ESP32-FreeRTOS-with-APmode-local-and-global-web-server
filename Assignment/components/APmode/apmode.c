@@ -11,6 +11,8 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 
+extern void stamode_stop(void);
+
 /* --- Configuration --- */
 #define AP_SSID "ESP32_Config_Wifi"
 #define AP_PASS "12345678"
@@ -329,6 +331,10 @@ static void stop_webserver(httpd_handle_t server) {
 /* --- MODE 1: Provisioning Mode (APSTA + WebServer) --- */
 void start_provisioning_mode(void) {
     ESP_LOGI(TAG, "Starting PROVISIONING MODE (AP)...");
+
+    /* FIX QUAN TRỌNG: Tắt Web Server & MQTT của STA Mode trước! */
+    stamode_stop();
+
     s_is_provisioning = true; // FLAG: We are in AP Mode
 
     /* Reset WiFi config to ensure clean slate */

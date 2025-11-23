@@ -64,6 +64,7 @@ extern const uint8_t logo_png_start[]       asm("_binary_sta_logoBK_png_start");
 extern const uint8_t logo_png_end[]         asm("_binary_sta_logoBK_png_end");
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
+static httpd_handle_t s_server = NULL; 
 
 /* --- NVS HELPER FUNCTIONS --- */
 
@@ -264,6 +265,20 @@ void stamode_publish_mqtt(float temp, float hum, int soil, int relay, int mode) 
         sprintf(payload, "{\"temperature\":%.1f,\"humidity\":%.1f,\"soil_moisture\":%d,\"relay\":%d,\"mode\":%d}", 
                 temp, hum, soil, relay, mode);
         esp_mqtt_client_publish(s_mqtt_client, "v1/devices/me/telemetry", payload, 0, 1, 0);
+    }
+}
+
+void stamode_stop(void) {
+    if (s_server) {
+        httpd_stop(s_server);
+        s_server = NULL;
+        ESP_LOGI(TAG, "STA Web Server Stopped");
+    }
+    if (s_mqtt_client) {
+        esp_mqtt_client_stop(s_mqtt_client);
+        esp_mqtt_client_destroy(s_mqtt_client);
+        s_mqtt_client = NULL;
+        ESP_LOGI(TAG, "MQTT Client Stopped");
     }
 }
 
