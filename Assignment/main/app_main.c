@@ -8,7 +8,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
-#include "mdns.h" // NEW: Thư viện mDNS để tạo domain .local
+#include "mdns.h"
 
 /* Include User Components */
 #include "apmode.h"
@@ -18,8 +18,8 @@
 #include "stamode.h"
 
 /* --- CONFIGURATION --- */
-#define BASE_TICK_RATE_MS       1000    // Chu kỳ cơ bản: 1 giây
-#define MQTT_PUBLISH_CYCLE      10      // Gửi MQTT mỗi 10 chu kỳ (10 * 1s = 10s)
+#define BASE_TICK_RATE_MS       1000    
+#define MQTT_PUBLISH_CYCLE      10      
 
 #define NETWORK_QUEUE_SIZE      20      
 #define DEVICE_QUEUE_SIZE       5       
@@ -32,10 +32,7 @@
 #define MQTT_BROKER_HOST        "app.coreiot.io"
 #define MQTT_BROKER_PORT        1883
 #define ACCESS_TOKEN            "wszmzebjxp41b0c5ynvv"
-
-// NEW: Định nghĩa Hostname (Tên miền local)
 #define MDNS_HOSTNAME           "smartgarden" 
-// -> Truy cập bằng: http://smartgarden.local
 
 static const char *TAG = "MAIN_APP";
 
@@ -52,8 +49,10 @@ typedef struct {
     int command_id; 
 } device_control_t;
 
-/* IMPORT function from STAmode */
-extern void stamode_get_config(float *t_th, int *t_op, float *h_th, int *h_op, int *s_th, int *s_op);
+/* UPDATED IMPORT function */
+extern void stamode_get_config(int *t_en, float *t_th, int *t_op, 
+                               int *h_en, float *h_th, int *h_op, 
+                               int *s_en, int *s_th, int *s_op);
 extern void stamode_get_sensor_values(float *temp, float *hum, int *soil);
 
 QueueHandle_t network_queue = NULL; 
@@ -65,25 +64,13 @@ static bool is_manual_mode = false;
 static bool is_stamode_services_started = false;
 static SemaphoreHandle_t wifi_connected_sem = NULL; 
 
-/* --- NEW: MDNS FUNCTION --- */
 void start_mdns_service()
 {
-    // Khởi tạo mDNS
     esp_err_t err = mdns_init();
-    if (err) {
-        ESP_LOGE(TAG, "MDNS Init failed: %d", err);
-        return;
-    }
-
-    // Đặt tên Hostname (ví dụ: smartgarden -> smartgarden.local)
+    if (err) { ESP_LOGE(TAG, "MDNS Init failed: %d", err); return; }
     mdns_hostname_set(MDNS_HOSTNAME);
-    
-    // Đặt tên Instance (Mô tả thiết bị khi scan)
     mdns_instance_name_set("Smart Garden ESP32 Device");
-
-    // Đăng ký dịch vụ HTTP để các app scan thấy (như Fing, Bonjour Browser)
     mdns_service_add("SmartGarden-Web", "_http", "_tcp", 80, NULL, 0);
-    
     ESP_LOGI(TAG, "mDNS Service started. Access via: http://%s.local", MDNS_HOSTNAME);
 }
 
@@ -112,6 +99,8 @@ void relay_control_task(void *pvParameters) {
     
     float t_th, h_th; 
     int t_op, h_op, s_th, s_op;
+    int t_en, h_en, s_en; // NEW: Biến bật/tắt
+
     float cur_temp, cur_hum;
     int cur_soil;
 
@@ -129,22 +118,33 @@ void relay_control_task(void *pvParameters) {
             else if (cmd.command_id == 0) { is_manual_mode = true; relay_off(RELAY_PIN); state_changed = true; }
         }
         
+        /* UPDATED: LOGIC AUTO THÔNG MINH HƠN */
         if (!is_manual_mode) {
             stamode_get_sensor_values(&cur_temp, &cur_hum, &cur_soil);
-            stamode_get_config(&t_th, &t_op, &h_th, &h_op, &s_th, &s_op);
+            stamode_get_config(&t_en, &t_th, &t_op, 
+                               &h_en, &h_th, &h_op, 
+                               &s_en, &s_th, &s_op);
 
             if (cur_temp != 0.0 && cur_soil != -1) {
-                bool cond_temp = (t_op == 1) ? (cur_temp > t_th) : (cur_temp < t_th);
-                bool cond_hum  = (h_op == 1) ? (cur_hum > h_th)  : (cur_hum < h_th);
-                bool cond_soil = (s_op == 1) ? (cur_soil > s_th) : (cur_soil < s_th);
-                bool should_be_on = cond_temp && cond_hum && cond_soil;
+                // Logic cho từng cảm biến:
+                // Nếu DISABLED (!en) -> Luôn coi là ĐÚNG (true) để không ảnh hưởng điều kiện khác
+                // Nếu ENABLED (en) -> Kiểm tra điều kiện thực tế
+                
+                bool cond_temp = (!t_en) || ((t_op == 1) ? (cur_temp > t_th) : (cur_temp < t_th));
+                bool cond_hum  = (!h_en) || ((h_op == 1) ? (cur_hum > h_th)  : (cur_hum < h_th));
+                bool cond_soil = (!s_en) || ((s_op == 1) ? (cur_soil > s_th) : (cur_soil < s_th));
+
+                // Chỉ bật nếu ít nhất 1 cảm biến được kích hoạt VÀ tất cả điều kiện enabled đều thỏa mãn
+                bool any_enabled = (t_en || h_en || s_en);
+                bool should_be_on = any_enabled && cond_temp && cond_hum && cond_soil;
 
                 int current_relay = (relay_get_state(RELAY_PIN) == RELAY_ON) ? 1 : 0;
                 
                 if (should_be_on != current_relay) {
                     if (should_be_on) relay_on(RELAY_PIN); else relay_off(RELAY_PIN);
                     state_changed = true;
-                    ESP_LOGI(TAG, "Auto Trig: T:%.1f H:%.1f S:%d -> ON", cur_temp, cur_hum, cur_soil);
+                    ESP_LOGI(TAG, "Auto Trig: T:%.1f H:%.1f S:%d [En:%d%d%d] -> %s", 
+                             cur_temp, cur_hum, cur_soil, t_en, h_en, s_en, should_be_on ? "ON":"OFF");
                 }
             }
         }
@@ -228,9 +228,8 @@ void app_main(void) {
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta(); // Khởi tạo interface STA
+    esp_netif_create_default_wifi_sta(); 
 
-    /* NEW: Khởi tạo mDNS ngay sau khi có Interface mạng */
     start_mdns_service();
 
     wifi_connected_sem = xSemaphoreCreateBinary();

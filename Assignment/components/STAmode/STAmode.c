@@ -5,15 +5,15 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h" 
-#include "nvs_flash.h" // NEW: Cần thiết cho NVS
-#include "nvs.h"       // NEW: Cần thiết cho NVS
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 static const char *TAG = "STAMode";
 #define NVS_NAMESPACE "storage"
-#define NVS_KEY_CONFIG "auto_cfg"
+#define NVS_KEY_CONFIG "auto_cfg_v2" // Đổi key để tránh xung đột struct cũ
 
 /* --- Global Data Storage --- */
 typedef struct {
@@ -24,23 +24,28 @@ typedef struct {
     int mode; 
 } http_packet_t;
 
-/* Struct lưu cấu hình Auto Mode */
+/* UPDATED: Struct lưu cấu hình Auto Mode (Thêm biến Enable) */
 typedef struct {
+    int temp_en;    // 0: Ignore, 1: Enable
     float temp_thresh;
     int temp_op;    
+    
+    int hum_en;     // 0: Ignore, 1: Enable
     float hum_thresh;
     int hum_op;     
+    
+    int soil_en;    // 0: Ignore, 1: Enable
     int soil_thresh;
     int soil_op;    
 } auto_config_t;
 
 static http_packet_t s_http_packet = {0};
 
-/* Default Settings */
+/* Default Settings: Chỉ kích hoạt Soil Sensor, bỏ qua Temp/Hum */
 static auto_config_t s_auto_config = {
-    .temp_thresh = 0.0, .temp_op = 1,
-    .hum_thresh = 0.0,  .hum_op = 1,
-    .soil_thresh = 30,  .soil_op = 0
+    .temp_en = 0, .temp_thresh = 0.0, .temp_op = 1,
+    .hum_en = 0,  .hum_thresh = 0.0,  .hum_op = 1,
+    .soil_en = 1, .soil_thresh = 30,  .soil_op = 0
 };
 
 extern QueueHandle_t device_queue; 
@@ -60,46 +65,34 @@ extern const uint8_t logo_png_end[]         asm("_binary_sta_logoBK_png_end");
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 
-/* --- NVS HELPER FUNCTIONS (NEW) --- */
+/* --- NVS HELPER FUNCTIONS --- */
 
-/* Lưu struct config vào Flash */
 static void save_config_nvs() {
     nvs_handle_t my_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) opening NVS handle!", esp_err_to_name(err));
-    } else {
-        // Lưu toàn bộ struct dưới dạng Blob (Binary Large Object)
+    if (err == ESP_OK) {
         err = nvs_set_blob(my_handle, NVS_KEY_CONFIG, &s_auto_config, sizeof(auto_config_t));
-        if (err == ESP_OK) {
-            err = nvs_commit(my_handle); // Bắt buộc phải commit
-            ESP_LOGI(TAG, "Config saved to NVS successfully!");
-        } else {
-            ESP_LOGE(TAG, "Failed to save blob!");
-        }
+        if (err == ESP_OK) nvs_commit(my_handle);
         nvs_close(my_handle);
+        ESP_LOGI(TAG, "Config Saved to NVS");
     }
 }
 
-/* Đọc struct config từ Flash khi khởi động */
 static void load_config_nvs() {
     nvs_handle_t my_handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS not found or empty, using defaults.");
-    } else {
+    if (err == ESP_OK) {
         size_t required_size = sizeof(auto_config_t);
         auto_config_t saved_cfg;
         err = nvs_get_blob(my_handle, NVS_KEY_CONFIG, &saved_cfg, &required_size);
         
         if (err == ESP_OK && required_size == sizeof(auto_config_t)) {
-            s_auto_config = saved_cfg; // Copy dữ liệu đã lưu vào biến chạy
-            ESP_LOGI(TAG, "Config loaded from NVS: T:%.1f H:%.1f S:%d", 
-                     s_auto_config.temp_thresh, s_auto_config.hum_thresh, s_auto_config.soil_thresh);
-        } else {
-            ESP_LOGW(TAG, "Failed to load blob or size mismatch!");
+            s_auto_config = saved_cfg;
+            ESP_LOGI(TAG, "Config Loaded: Soil En=%d, Thresh=%d", s_auto_config.soil_en, s_auto_config.soil_thresh);
         }
         nvs_close(my_handle);
+    } else {
+        ESP_LOGW(TAG, "No config found, using defaults");
     }
 }
 
@@ -108,11 +101,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     esp_mqtt_event_handle_t event = event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT Connected");
         esp_mqtt_client_subscribe(s_mqtt_client, "v1/devices/me/rpc/request/+", 0);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "MQTT Disconnected");
         break;
     case MQTT_EVENT_DATA:
         if (device_queue) {
@@ -159,45 +148,47 @@ static esp_err_t sensors_api_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-/* Settings GET: Trả về cấu hình hiện tại */
+/* UPDATED: GET Settings Handler (Thêm các biến Enabled: te, he, se) */
 static esp_err_t settings_get_handler(httpd_req_t *req) {
-    char json[256];
-    sprintf(json, "{\"tt\":%.1f,\"to\":%d,\"ht\":%.1f,\"ho\":%d,\"st\":%d,\"so\":%d}", 
-            s_auto_config.temp_thresh, s_auto_config.temp_op,
-            s_auto_config.hum_thresh, s_auto_config.hum_op,
-            s_auto_config.soil_thresh, s_auto_config.soil_op);
+    char json[300];
+    sprintf(json, "{\"te\":%d,\"tt\":%.1f,\"to\":%d,\"he\":%d,\"ht\":%.1f,\"ho\":%d,\"se\":%d,\"st\":%d,\"so\":%d}", 
+            s_auto_config.temp_en, s_auto_config.temp_thresh, s_auto_config.temp_op,
+            s_auto_config.hum_en, s_auto_config.hum_thresh, s_auto_config.hum_op,
+            s_auto_config.soil_en, s_auto_config.soil_thresh, s_auto_config.soil_op);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, strlen(json));
     return ESP_OK;
 }
 
-/* Settings POST: Lưu cấu hình mới và ghi vào NVS */
+/* UPDATED: POST Settings Handler (Parse thêm te, he, se) */
 static esp_err_t settings_post_handler(httpd_req_t *req) {
-    char buf[256];
+    char buf[512];
     int ret = httpd_req_recv(req, buf, sizeof(buf));
     if (ret <= 0) return ESP_FAIL;
     buf[ret] = '\0';
     
-    float tt = s_auto_config.temp_thresh; float ht = s_auto_config.hum_thresh;
-    int to = s_auto_config.temp_op; int ho = s_auto_config.hum_op;
-    int st = s_auto_config.soil_thresh; int so = s_auto_config.soil_op;
+    int te = s_auto_config.temp_en; float tt = s_auto_config.temp_thresh; int to = s_auto_config.temp_op;
+    int he = s_auto_config.hum_en; float ht = s_auto_config.hum_thresh; int ho = s_auto_config.hum_op;
+    int se = s_auto_config.soil_en; int st = s_auto_config.soil_thresh; int so = s_auto_config.soil_op;
 
     char *ptr;
+    if ((ptr = strstr(buf, "\"te\":"))) te = atoi(ptr + 5);
     if ((ptr = strstr(buf, "\"tt\":"))) tt = atof(ptr + 5);
     if ((ptr = strstr(buf, "\"to\":"))) to = atoi(ptr + 5);
+    
+    if ((ptr = strstr(buf, "\"he\":"))) he = atoi(ptr + 5);
     if ((ptr = strstr(buf, "\"ht\":"))) ht = atof(ptr + 5);
     if ((ptr = strstr(buf, "\"ho\":"))) ho = atoi(ptr + 5);
+    
+    if ((ptr = strstr(buf, "\"se\":"))) se = atoi(ptr + 5);
     if ((ptr = strstr(buf, "\"st\":"))) st = atoi(ptr + 5);
     if ((ptr = strstr(buf, "\"so\":"))) so = atoi(ptr + 5);
 
-    // Cập nhật biến RAM
-    s_auto_config.temp_thresh = tt; s_auto_config.temp_op = to;
-    s_auto_config.hum_thresh = ht;  s_auto_config.hum_op = ho;
-    s_auto_config.soil_thresh = st; s_auto_config.soil_op = so;
+    s_auto_config.temp_en = te; s_auto_config.temp_thresh = tt; s_auto_config.temp_op = to;
+    s_auto_config.hum_en = he;  s_auto_config.hum_thresh = ht;  s_auto_config.hum_op = ho;
+    s_auto_config.soil_en = se; s_auto_config.soil_thresh = st; s_auto_config.soil_op = so;
 
-    // NEW: Lưu vào Flash ngay lập tức
     save_config_nvs();
-
     httpd_resp_send(req, "OK", 2);
     return ESP_OK;
 }
@@ -231,11 +222,19 @@ static esp_err_t control_mode_handler(httpd_req_t *req) {
 
 /* --- PUBLIC FUNCTIONS --- */
 
-void stamode_get_config(float *t_th, int *t_op, float *h_th, int *h_op, int *s_th, int *s_op) {
+/* UPDATED: Export thêm các biến enabled */
+void stamode_get_config(int *t_en, float *t_th, int *t_op, 
+                        int *h_en, float *h_th, int *h_op, 
+                        int *s_en, int *s_th, int *s_op) {
+    *t_en = s_auto_config.temp_en;
     *t_th = s_auto_config.temp_thresh;
     *t_op = s_auto_config.temp_op;
+    
+    *h_en = s_auto_config.hum_en;
     *h_th = s_auto_config.hum_thresh;
     *h_op = s_auto_config.hum_op;
+    
+    *s_en = s_auto_config.soil_en;
     *s_th = s_auto_config.soil_thresh;
     *s_op = s_auto_config.soil_op;
 }
@@ -269,7 +268,6 @@ void stamode_publish_mqtt(float temp, float hum, int soil, int relay, int mode) 
 }
 
 void stamode_start(const char *broker_uri, int mqtt_port, const char *mqtt_token) {
-    // NEW: Load cấu hình từ NVS ngay khi khởi động STA Mode
     load_config_nvs();
 
     httpd_handle_t server = NULL;
