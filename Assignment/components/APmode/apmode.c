@@ -20,12 +20,12 @@
 static const char *TAG = "WiFiManager";
 
 /* --- EMBEDDED FILES --- */
-extern const uint8_t index_html_start[] asm("_binary_index_html_start");
-extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
-extern const uint8_t favicon_png_start[] asm("_binary_favicon_32x32_png_start");
-extern const uint8_t favicon_png_end[]   asm("_binary_favicon_32x32_png_end");
-extern const uint8_t logo_png_start[]    asm("_binary_logoBK_png_start");
-extern const uint8_t logo_png_end[]      asm("_binary_logoBK_png_end");
+extern const uint8_t index_html_start[] asm("_binary_ap_index_html_start");
+extern const uint8_t index_html_end[]   asm("_binary_ap_index_html_end");
+extern const uint8_t favicon_png_start[] asm("_binary_ap_favicon_32x32_png_start");
+extern const uint8_t favicon_png_end[]   asm("_binary_ap_favicon_32x32_png_end");
+extern const uint8_t logo_png_start[]    asm("_binary_ap_logoBK_png_start");
+extern const uint8_t logo_png_end[]      asm("_binary_ap_logoBK_png_end");
 
 /* --- Global State Management --- */
 typedef enum {

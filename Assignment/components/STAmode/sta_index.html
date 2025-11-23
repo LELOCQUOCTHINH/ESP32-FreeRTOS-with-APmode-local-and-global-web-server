@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Smart Garden</title>
+<link rel="icon" href="/favicon.ico" type="image/png">
+<style>
+    /* --- GENERAL STYLES --- */
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f9; text-align: center; padding: 20px; margin: 0; color: #333; }
+    .card { background: white; border-radius: 12px; box-shadow: 0 6px 18px rgba(0,0,0,0.08); padding: 25px; max-width: 420px; margin: 20px auto; border-top: 5px solid #0056b3; position: relative; }
+    
+    /* --- HEADER --- */
+    .header { display: flex; align-items: center; justify-content: flex-start; margin-bottom: 25px; border-bottom: 1px solid #eee; padding-bottom: 15px; position: relative; }
+    .logo { width: 55px; height: auto; margin-right: 15px; }
+    .header-text { text-align: left; }
+    h2 { color: #333; margin: 0; font-size: 1.4rem; text-transform: uppercase; letter-spacing: 1px; }
+    
+    /* Help Button */
+    .btn-help { position: absolute; right: 0; top: 5px; background: transparent; border: 2px solid #0056b3; color: #0056b3; border-radius: 50%; width: 30px; height: 30px; font-weight: bold; cursor: pointer; transition: all 0.2s; font-size: 16px; line-height: 1; padding: 0; }
+    .btn-help:hover { background: #0056b3; color: white; }
+
+    /* --- STATUS BADGE --- */
+    .status-badge { display: inline-block; padding: 6px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: 800; color: white; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 5px;}
+    .status-auto { background: #28a745; } .status-manual { background: #ffc107; color: #333; }
+
+    /* --- SENSOR GRID --- */
+    .sensor-grid { display: grid; grid-template-columns: 1fr; gap: 15px; margin-bottom: 25px; }
+    .sensor-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #ddd;}
+    .label { font-weight: 600; color: #666; font-size: 0.95rem; } 
+    .value { font-weight: 700; color: #0056b3; font-size: 1.1rem; }
+    .relay-indicator { padding: 5px 12px; border-radius: 4px; color: white; font-weight: bold; font-size: 0.9rem; min-width: 40px; text-align: center; }
+    .on { background: #28a745; } .off { background: #dc3545; }
+
+    /* --- CONTROLS --- */
+    .controls { display: flex; flex-direction: column; gap: 12px; }
+    .btn { width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer; transition: all 0.2s; text-transform: uppercase; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .btn:active { transform: scale(0.98); box-shadow: none; }
+    .btn:disabled { background: #e9ecef; color: #adb5bd; cursor: not-allowed; box-shadow: none; opacity: 0.7; }
+    .btn-mode { background: #6c757d; color: white; } .btn-toggle { background: #007bff; color: white; }
+    .btn-set { background: #17a2b8; color: white; }
+    
+    .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #fff; animation: spin 1s ease-in-out infinite; margin-right: 8px; vertical-align: middle; display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .btn.loading .spinner { display: inline-block; }
+    
+    /* --- SETTINGS PANEL --- */
+    #settingsPanel { display: none; background: #fafafa; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin-top: 15px; text-align: left; animation: fadeIn 0.3s; }
+    .setting-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .setting-label { font-size: 0.9rem; font-weight: 600; width: 30%; }
+    .setting-input, .setting-select { width: 32%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+    .hint { font-size: 0.8rem; color: #666; margin-bottom: 15px; font-style: italic; background: #e9ecef; padding: 8px; border-radius: 4px; border-left: 3px solid #17a2b8; }
+    
+    /* --- MODAL (USER GUIDE) --- */
+    .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.5); backdrop-filter: blur(2px); }
+    .modal-content { background-color: #fff; margin: 10% auto; padding: 0; border-radius: 10px; width: 90%; max-width: 500px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); text-align: left; position: relative; animation: slideDown 0.3s; }
+    .modal-header { padding: 15px 20px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; background: #0056b3; color: white; border-radius: 10px 10px 0 0; }
+    .modal-header h3 { margin: 0; font-size: 1.1rem; }
+    .close-btn { color: white; font-size: 24px; font-weight: bold; cursor: pointer; }
+    .modal-body { padding: 20px; font-size: 0.95rem; line-height: 1.6; max-height: 60vh; overflow-y: auto; }
+    .modal-body h4 { color: #0056b3; margin-top: 15px; margin-bottom: 5px; border-bottom: 1px solid #eee; padding-bottom: 5px; }
+    .modal-body ul { margin: 5px 0 15px 20px; padding: 0; }
+    .modal-body li { margin-bottom: 5px; }
+    .note { font-size: 0.85rem; color: #666; background: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 10px; }
+
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+</style>
+</head>
+<body>
+
+    <!-- MAIN DASHBOARD -->
+    <div class="card">
+        <div class="header">
+            <img src="/logo.png" class="logo" alt="Logo">
+            <div class="header-text">
+                <h2>Smart Garden</h2>
+                <span id="modeBadge" class="status-badge status-auto">Auto Mode</span>
+            </div>
+            <button class="btn-help" onclick="openHelp()" title="User Guide">?</button>
+        </div>
+        
+        <div class="sensor-grid">
+            <div class="sensor-item"><span class="label">Temperature</span><span class="value" id="temp">-- °C</span></div>
+            <div class="sensor-item"><span class="label">Humidity</span><span class="value" id="hum">-- %</span></div>
+            <div class="sensor-item"><span class="label">Soil Moisture</span><span class="value" id="soil">-- %</span></div>
+            <div class="sensor-item"><span class="label">Pump Status</span><span class="value"><span id="relay" class="relay-indicator off">OFF</span></span></div>
+        </div>
+        
+        <div class="controls">
+            <button id="btnMode" class="btn btn-mode" onclick="switchMode()"><span class="spinner"></span><span class="btn-text">Switch to Manual Control</span></button>
+            <button id="btnToggle" class="btn btn-toggle" onclick="toggleRelay()" disabled><span class="spinner"></span><span class="btn-text">Toggle Pump (Manual Only)</span></button>
+            <button class="btn btn-set" onclick="toggleSettings()">Auto Mode Settings</button>
+        </div>
+
+        <!-- SETTINGS PANEL -->
+        <div id="settingsPanel">
+            <h4>Auto Trigger Conditions</h4>
+            <div class="hint">
+                <strong>Logic:</strong> The Pump will turn ON only if <b>ALL</b> conditions below are met simultaneously (AND Logic).
+            </div>
+            
+            <div class="setting-row">
+                <span class="setting-label">Temp (°C)</span>
+                <select id="op_temp" class="setting-select"><option value="1">Greater (>)</option><option value="0">Less (<)</option></select>
+                <input type="number" id="val_temp" class="setting-input" step="0.1">
+            </div>
+            
+            <div class="setting-row">
+                <span class="setting-label">Humidity (%)</span>
+                <select id="op_hum" class="setting-select"><option value="1">Greater (>)</option><option value="0">Less (<)</option></select>
+                <input type="number" id="val_hum" class="setting-input" step="0.1">
+            </div>
+
+            <div class="setting-row">
+                <span class="setting-label">Soil (%)</span>
+                <select id="op_soil" class="setting-select"><option value="1">Greater (>)</option><option value="0">Less (<)</option></select>
+                <input type="number" id="val_soil" class="setting-input" step="1">
+            </div>
+            
+            <div style="text-align: center; margin-top: 15px;">
+                <button class="btn btn-toggle" onclick="saveSettings()" style="width: auto; padding: 10px 30px;">Save & Apply Configuration</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- USER GUIDE MODAL -->
+    <div id="helpModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>User Guide & Documentation</h3>
+                <span class="close-btn" onclick="closeHelp()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <h4>1. System Overview</h4>
+                <p>Welcome to the Smart Garden Control Panel. This dashboard allows you to monitor environmental conditions and control the irrigation pump.</p>
+                
+                <h4>2. Operating Modes</h4>
+                <ul>
+                    <li><b>AUTO MODE (Default):</b> The system automatically controls the pump based on sensor readings and your configured settings. Data updates every 10 seconds.</li>
+                    <li><b>MANUAL MODE:</b> You have full control. You can toggle the pump ON/OFF using the "Toggle Pump" button. Data updates every 1 second for real-time feedback.</li>
+                </ul>
+
+                <h4>3. Automation Settings</h4>
+                <p>Click "Auto Mode Settings" to configure thresholds. The system uses <b>AND Logic</b>:</p>
+                <div class="note">PUMP ON = (Temp Condition) <b>AND</b> (Humidity Condition) <b>AND</b> (Soil Condition)</div>
+                <p><i>Example: If you set Soil < 30% and Temp > 25°C, the pump will only turn on when the soil is dry AND it is hot.</i></p>
+
+                <h4>4. Connection</h4>
+                <p>You can access this dashboard anytime via <b>http://smartgarden.local</b> as long as your device is on the same WiFi network.</p>
+                
+                <h4>5. Data Safety</h4>
+                <p>Your settings are saved to the device's permanent memory (Flash) and will be restored automatically after a power loss or restart.</p>
+            </div>
+        </div>
+    </div>
+
+<script>
+/* --- CORE VARIABLES --- */
+let currentMode = 0; 
+let pollInterval = 10000; 
+let intervalId = null;
+let isProcessing = false;
+
+/* --- POLLING LOGIC --- */
+function startPolling(interval) {
+    if (intervalId && pollInterval === interval) return;
+    if (intervalId) clearInterval(intervalId);
+    pollInterval = interval;
+    intervalId = setInterval(updateData, pollInterval);
+}
+
+function updateUI(data) {
+    if (isProcessing) return; 
+
+    document.getElementById('temp').innerText = data.temp.toFixed(1) + ' °C';
+    document.getElementById('hum').innerText = data.hum.toFixed(1) + ' %';
+    document.getElementById('soil').innerText = data.soil + ' %';
+    
+    var r = document.getElementById('relay');
+    if(data.relay) { r.innerText='ON'; r.className='relay-indicator on'; }
+    else { r.innerText='OFF'; r.className='relay-indicator off'; }
+
+    currentMode = data.mode; 
+    const badge = document.getElementById('modeBadge');
+    const btnMode = document.getElementById('btnMode').querySelector('.btn-text');
+    const btnToggle = document.getElementById('btnToggle');
+
+    if (currentMode === 1) { // Manual
+        badge.innerText = 'MANUAL CONTROL';
+        badge.className = 'status-badge status-manual';
+        btnMode.innerText = 'Switch to Automatic';
+        btnToggle.disabled = false;
+        startPolling(1000); 
+    } else { // Auto
+        badge.innerText = 'AUTO MODE';
+        badge.className = 'status-badge status-auto';
+        btnMode.innerText = 'Switch to Manual Control';
+        btnToggle.disabled = true;
+        startPolling(10000); 
+    }
+}
+
+function updateData() {
+    fetch('/api/sensors').then(res => res.json()).then(data => {
+        updateUI(data);
+    }).catch(err => console.error('Poll error:', err));
+}
+
+/* --- BUTTON STATES --- */
+function setButtonLoading(btnId, isLoading) {
+    const btn = document.getElementById(btnId);
+    if (isLoading) {
+        btn.classList.add('loading');
+        btn.disabled = true;
+        isProcessing = true; 
+    } else {
+        btn.classList.remove('loading');
+        btn.disabled = (btnId === 'btnToggle' && currentMode === 0); 
+        isProcessing = false;
+    }
+}
+
+function fastRefresh(btnId) {
+    setTimeout(() => {
+        fetch('/api/sensors').then(res => res.json()).then(data => {
+            isProcessing = false; 
+            updateUI(data); 
+            if(btnId) setButtonLoading(btnId, false);
+        });
+    }, 100); 
+}
+
+/* --- ACTIONS --- */
+function switchMode() {
+    if (isProcessing) return;
+    setButtonLoading('btnMode', true);
+    const newModeCmd = (currentMode === 0) ? 3 : 2;
+    
+    fetch('/api/control', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({command: newModeCmd})
+    })
+    .then(response => {
+        if (response.ok) fastRefresh('btnMode');
+        else throw new Error('Server error');
+    })
+    .catch(err => { alert('Failed'); setButtonLoading('btnMode', false); });
+}
+
+function toggleRelay() {
+    if (isProcessing) return;
+    setButtonLoading('btnToggle', true);
+    fetch('/api/relay/toggle', {method: 'POST'})
+    .then(response => {
+        if (response.ok) fastRefresh('btnToggle');
+        else throw new Error('Server error');
+    })
+    .catch(err => { alert('Failed'); setButtonLoading('btnToggle', false); });
+}
+
+/* --- SETTINGS LOGIC --- */
+function toggleSettings() {
+    const p = document.getElementById('settingsPanel');
+    if (p.style.display === 'block') {
+        p.style.display = 'none';
+    } else {
+        p.style.display = 'block';
+        fetch('/api/settings').then(res=>res.json()).then(d => {
+            document.getElementById('val_temp').value = d.tt;
+            document.getElementById('op_temp').value = d.to;
+            document.getElementById('val_hum').value = d.ht;
+            document.getElementById('op_hum').value = d.ho;
+            document.getElementById('val_soil').value = d.st;
+            document.getElementById('op_soil').value = d.so;
+        });
+    }
+}
+
+function saveSettings() {
+    const data = {
+        tt: parseFloat(document.getElementById('val_temp').value),
+        to: parseInt(document.getElementById('op_temp').value),
+        ht: parseFloat(document.getElementById('val_hum').value),
+        ho: parseInt(document.getElementById('op_hum').value),
+        st: parseInt(document.getElementById('val_soil').value),
+        so: parseInt(document.getElementById('op_soil').value)
+    };
+
+    fetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+    }).then(res => {
+        if(res.ok) {
+            alert("Configuration Saved Successfully!");
+            toggleSettings(); 
+        } else alert("Failed to save.");
+    });
+}
+
+/* --- HELP MODAL LOGIC --- */
+function openHelp() { document.getElementById('helpModal').style.display = "block"; }
+function closeHelp() { document.getElementById('helpModal').style.display = "none"; }
+window.onclick = function(event) {
+    if (event.target == document.getElementById('helpModal')) {
+        closeHelp();
+    }
+}
+
+// Init
+updateData();
+startPolling(10000); 
+</script>
+</body>
+</html>

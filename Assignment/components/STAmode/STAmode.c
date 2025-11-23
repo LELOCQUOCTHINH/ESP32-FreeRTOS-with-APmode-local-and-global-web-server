@@ -1,56 +1,310 @@
-#include "STAmode.h"
-#include "mqtt_client.h"
+#include "stamode.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
-#include <stdio.h> // For sprintf
+#include "mqtt_client.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h" 
+#include "nvs_flash.h" // NEW: Cần thiết cho NVS
+#include "nvs.h"       // NEW: Cần thiết cho NVS
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-static const char *TAG = "MQTT_APP";
-static esp_mqtt_client_handle_t s_client = NULL;
+static const char *TAG = "STAMode";
+#define NVS_NAMESPACE "storage"
+#define NVS_KEY_CONFIG "auto_cfg"
 
+/* --- Global Data Storage --- */
+typedef struct {
+    float temp;
+    float hum;
+    int soil;
+    int relay;
+    int mode; 
+} http_packet_t;
+
+/* Struct lưu cấu hình Auto Mode */
+typedef struct {
+    float temp_thresh;
+    int temp_op;    
+    float hum_thresh;
+    int hum_op;     
+    int soil_thresh;
+    int soil_op;    
+} auto_config_t;
+
+static http_packet_t s_http_packet = {0};
+
+/* Default Settings */
+static auto_config_t s_auto_config = {
+    .temp_thresh = 0.0, .temp_op = 1,
+    .hum_thresh = 0.0,  .hum_op = 1,
+    .soil_thresh = 30,  .soil_op = 0
+};
+
+extern QueueHandle_t device_queue; 
+
+typedef struct {
+    int command_id;
+    int value; 
+} device_control_t; 
+
+/* --- EMBEDDED FILES --- */
+extern const uint8_t sta_index_html_start[] asm("_binary_sta_index_html_start");
+extern const uint8_t sta_index_html_end[]   asm("_binary_sta_index_html_end");
+extern const uint8_t favicon_png_start[]    asm("_binary_sta_favicon_32x32_png_start");
+extern const uint8_t favicon_png_end[]      asm("_binary_sta_favicon_32x32_png_end");
+extern const uint8_t logo_png_start[]       asm("_binary_sta_logoBK_png_start");
+extern const uint8_t logo_png_end[]         asm("_binary_sta_logoBK_png_end");
+
+static esp_mqtt_client_handle_t s_mqtt_client = NULL;
+
+/* --- NVS HELPER FUNCTIONS (NEW) --- */
+
+/* Lưu struct config vào Flash */
+static void save_config_nvs() {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) opening NVS handle!", esp_err_to_name(err));
+    } else {
+        // Lưu toàn bộ struct dưới dạng Blob (Binary Large Object)
+        err = nvs_set_blob(my_handle, NVS_KEY_CONFIG, &s_auto_config, sizeof(auto_config_t));
+        if (err == ESP_OK) {
+            err = nvs_commit(my_handle); // Bắt buộc phải commit
+            ESP_LOGI(TAG, "Config saved to NVS successfully!");
+        } else {
+            ESP_LOGE(TAG, "Failed to save blob!");
+        }
+        nvs_close(my_handle);
+    }
+}
+
+/* Đọc struct config từ Flash khi khởi động */
+static void load_config_nvs() {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS not found or empty, using defaults.");
+    } else {
+        size_t required_size = sizeof(auto_config_t);
+        auto_config_t saved_cfg;
+        err = nvs_get_blob(my_handle, NVS_KEY_CONFIG, &saved_cfg, &required_size);
+        
+        if (err == ESP_OK && required_size == sizeof(auto_config_t)) {
+            s_auto_config = saved_cfg; // Copy dữ liệu đã lưu vào biến chạy
+            ESP_LOGI(TAG, "Config loaded from NVS: T:%.1f H:%.1f S:%d", 
+                     s_auto_config.temp_thresh, s_auto_config.hum_thresh, s_auto_config.soil_thresh);
+        } else {
+            ESP_LOGW(TAG, "Failed to load blob or size mismatch!");
+        }
+        nvs_close(my_handle);
+    }
+}
+
+/* --- MQTT Event Handler --- */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT Connected");
+        esp_mqtt_client_subscribe(s_mqtt_client, "v1/devices/me/rpc/request/+", 0);
         break;
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "MQTT Disconnected");
+        ESP_LOGW(TAG, "MQTT Disconnected");
         break;
-    case MQTT_EVENT_PUBLISHED:
-        ESP_LOGI(TAG, "Published ID=%d", event->msg_id);
+    case MQTT_EVENT_DATA:
+        if (device_queue) {
+            device_control_t cmd;
+            bool valid = false;
+            if (strstr(event->data, "setRelay")) {
+                cmd.command_id = (strstr(event->data, "true") || strstr(event->data, "1")) ? 1 : 0;
+                valid = true;
+            } else if (strstr(event->data, "setMode")) {
+                if (strstr(event->data, "manual")) cmd.command_id = 3;
+                else cmd.command_id = 2;
+                valid = true;
+            }
+            if (valid) xQueueSend(device_queue, &cmd, 0);
+        }
         break;
-    case MQTT_EVENT_ERROR:
-        ESP_LOGE(TAG, "MQTT Error");
-        break;
-    default:
-        break;
+    default: break;
     }
 }
 
-void mqtt_app_start(const char *host, int port, const char *access_token) {
-    if (s_client != NULL) {
-        ESP_LOGW(TAG, "MQTT Client already started");
-        return;
+/* --- HTTP Handlers --- */
+static esp_err_t root_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, (const char *)sta_index_html_start, sta_index_html_end - sta_index_html_start);
+    return ESP_OK;
+}
+static esp_err_t favicon_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "image/png");
+    httpd_resp_send(req, (const char *)favicon_png_start, favicon_png_end - favicon_png_start);
+    return ESP_OK;
+}
+static esp_err_t logo_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "image/png");
+    httpd_resp_send(req, (const char *)logo_png_start, logo_png_end - logo_png_start);
+    return ESP_OK;
+}
+
+static esp_err_t sensors_api_handler(httpd_req_t *req) {
+    char json[128];
+    sprintf(json, "{\"temp\":%.1f,\"hum\":%.1f,\"soil\":%d,\"relay\":%d,\"mode\":%d}", 
+            s_http_packet.temp, s_http_packet.hum, s_http_packet.soil, s_http_packet.relay, s_http_packet.mode);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    return ESP_OK;
+}
+
+/* Settings GET: Trả về cấu hình hiện tại */
+static esp_err_t settings_get_handler(httpd_req_t *req) {
+    char json[256];
+    sprintf(json, "{\"tt\":%.1f,\"to\":%d,\"ht\":%.1f,\"ho\":%d,\"st\":%d,\"so\":%d}", 
+            s_auto_config.temp_thresh, s_auto_config.temp_op,
+            s_auto_config.hum_thresh, s_auto_config.hum_op,
+            s_auto_config.soil_thresh, s_auto_config.soil_op);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    return ESP_OK;
+}
+
+/* Settings POST: Lưu cấu hình mới và ghi vào NVS */
+static esp_err_t settings_post_handler(httpd_req_t *req) {
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf));
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+    
+    float tt = s_auto_config.temp_thresh; float ht = s_auto_config.hum_thresh;
+    int to = s_auto_config.temp_op; int ho = s_auto_config.hum_op;
+    int st = s_auto_config.soil_thresh; int so = s_auto_config.soil_op;
+
+    char *ptr;
+    if ((ptr = strstr(buf, "\"tt\":"))) tt = atof(ptr + 5);
+    if ((ptr = strstr(buf, "\"to\":"))) to = atoi(ptr + 5);
+    if ((ptr = strstr(buf, "\"ht\":"))) ht = atof(ptr + 5);
+    if ((ptr = strstr(buf, "\"ho\":"))) ho = atoi(ptr + 5);
+    if ((ptr = strstr(buf, "\"st\":"))) st = atoi(ptr + 5);
+    if ((ptr = strstr(buf, "\"so\":"))) so = atoi(ptr + 5);
+
+    // Cập nhật biến RAM
+    s_auto_config.temp_thresh = tt; s_auto_config.temp_op = to;
+    s_auto_config.hum_thresh = ht;  s_auto_config.hum_op = ho;
+    s_auto_config.soil_thresh = st; s_auto_config.soil_op = so;
+
+    // NEW: Lưu vào Flash ngay lập tức
+    save_config_nvs();
+
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+static esp_err_t relay_toggle_handler(httpd_req_t *req) {
+    device_control_t cmd;
+    cmd.command_id = (s_http_packet.relay == 1) ? 0 : 1; 
+    if (device_queue) {
+        xQueueSend(device_queue, &cmd, 0);
+        httpd_resp_send(req, "OK", 2);
+    } else httpd_resp_send_500(req);
+    return ESP_OK;
+}
+
+static esp_err_t control_mode_handler(httpd_req_t *req) {
+    char buf[100];
+    int ret = httpd_req_recv(req, buf, sizeof(buf));
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+    int cmd_id = -1;
+    if (strstr(buf, "2")) cmd_id = 2; 
+    if (strstr(buf, "3")) cmd_id = 3; 
+    if (cmd_id != -1 && device_queue) {
+        device_control_t cmd;
+        cmd.command_id = cmd_id;
+        xQueueSend(device_queue, &cmd, 0);
+        httpd_resp_send(req, "OK", 2);
+    } else httpd_resp_send_500(req);
+    return ESP_OK;
+}
+
+/* --- PUBLIC FUNCTIONS --- */
+
+void stamode_get_config(float *t_th, int *t_op, float *h_th, int *h_op, int *s_th, int *s_op) {
+    *t_th = s_auto_config.temp_thresh;
+    *t_op = s_auto_config.temp_op;
+    *h_th = s_auto_config.hum_thresh;
+    *h_op = s_auto_config.hum_op;
+    *s_th = s_auto_config.soil_thresh;
+    *s_op = s_auto_config.soil_op;
+}
+
+void stamode_get_sensor_values(float *temp, float *hum, int *soil) {
+    *temp = s_http_packet.temp;
+    *hum = s_http_packet.hum;
+    *soil = s_http_packet.soil;
+}
+
+void stamode_update_http_data(float temp, float hum, int soil, int relay, int mode) {
+    s_http_packet.temp = temp;
+    s_http_packet.hum = hum;
+    s_http_packet.soil = soil;
+    s_http_packet.relay = relay;
+    s_http_packet.mode = mode;
+}
+
+void stamode_update_relay_status_http(int relay_state, int mode) {
+    s_http_packet.relay = relay_state;
+    s_http_packet.mode = mode;
+}
+
+void stamode_publish_mqtt(float temp, float hum, int soil, int relay, int mode) {
+    if (s_mqtt_client) {
+        char payload[128];
+        sprintf(payload, "{\"temperature\":%.1f,\"humidity\":%.1f,\"soil_moisture\":%d,\"relay\":%d,\"mode\":%d}", 
+                temp, hum, soil, relay, mode);
+        esp_mqtt_client_publish(s_mqtt_client, "v1/devices/me/telemetry", payload, 0, 1, 0);
+    }
+}
+
+void stamode_start(const char *broker_uri, int mqtt_port, const char *mqtt_token) {
+    // NEW: Load cấu hình từ NVS ngay khi khởi động STA Mode
+    load_config_nvs();
+
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 12; 
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_handler };
+        httpd_uri_t favicon = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler };
+        httpd_uri_t logo = { .uri = "/logo.png", .method = HTTP_GET, .handler = logo_handler };
+        httpd_uri_t api_sen = { .uri = "/api/sensors", .method = HTTP_GET, .handler = sensors_api_handler };
+        httpd_uri_t api_set_get = { .uri = "/api/settings", .method = HTTP_GET, .handler = settings_get_handler };
+        httpd_uri_t api_set_post = { .uri = "/api/settings", .method = HTTP_POST, .handler = settings_post_handler };
+        httpd_uri_t api_rel = { .uri = "/api/relay/toggle", .method = HTTP_POST, .handler = relay_toggle_handler };
+        httpd_uri_t api_mode = { .uri = "/api/control", .method = HTTP_POST, .handler = control_mode_handler };
+        
+        httpd_register_uri_handler(server, &root);
+        httpd_register_uri_handler(server, &favicon);
+        httpd_register_uri_handler(server, &logo);
+        httpd_register_uri_handler(server, &api_sen);
+        httpd_register_uri_handler(server, &api_set_get);
+        httpd_register_uri_handler(server, &api_set_post);
+        httpd_register_uri_handler(server, &api_rel);
+        httpd_register_uri_handler(server, &api_mode);
+        
+        ESP_LOGI(TAG, "Local Dashboard started on Port 80");
     }
 
-    /* Construct the full URI string, e.g., "mqtt://app.coreiot.io:1883" */
-    char uri[128];
-    sprintf(uri, "mqtt://%s:%d", host, port);
-
+    char full_uri[128];
+    sprintf(full_uri, "mqtt://%s:%d", broker_uri, mqtt_port);
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = uri,
-        .credentials.username = access_token, /* Thingsboard uses token as username */
-        /* .credentials.authentication.password = "", // Password is usually empty for token auth */
+        .broker.address.uri = full_uri,
+        .credentials.username = mqtt_token,
     };
-
-    ESP_LOGI(TAG, "Connecting to %s with Token: %s", uri, access_token);
-
-    s_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(s_client);
-}
-
-int mqtt_app_publish(const char *topic, const char *data) {
-    if (s_client == NULL) return -1;
-    /* QoS 1 ensures delivery */
-    return esp_mqtt_client_publish(s_client, topic, data, 0, 1, 0);
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
 }

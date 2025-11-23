@@ -6,21 +6,16 @@
 extern "C" {
 #endif
 
-/**
- * @brief Start MQTT Client with specified connection details.
- * * @param host MQTT Broker Host (e.g., "app.coreiot.io")
- * @param port MQTT Broker Port (e.g., 1883)
- * @param access_token Access Token (used as Username)
- */
-void mqtt_app_start(const char *host, int port, const char *access_token);
+void stamode_start(const char *mqtt_broker_uri, int mqtt_port, const char *mqtt_token);
 
-/**
- * @brief Publish data to a specific topic.
- * * @param topic The topic string (e.g., "v1/devices/me/telemetry")
- * @param data The payload string (e.g., "{\"temp\": 25}")
- * @return int Message ID on success, -1 on failure.
- */
-int mqtt_app_publish(const char *topic, const char *data);
+/* Hàm này CHỈ cập nhật dữ liệu cho Local Web Server (HTTP Packet) */
+void stamode_update_http_data(float temp, float hum, int soil, int relay, int mode);
+
+/* Hàm này CHỈ thực hiện gửi tin nhắn MQTT (MQTT Packet) */
+void stamode_publish_mqtt(float temp, float hum, int soil, int relay, int mode);
+
+/* Hàm cập nhật nhanh trạng thái Relay cho Web (dùng khi bấm nút) */
+void stamode_update_relay_status_http(int relay_state, int mode);
 
 #ifdef __cplusplus
 }
