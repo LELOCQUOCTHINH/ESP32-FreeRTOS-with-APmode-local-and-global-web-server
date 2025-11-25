@@ -1,0 +1,3 @@
+[submodule "smart-garden-dashboard"]
+	path = smart-garden-dashboard
+	url = https://github.com/LELOCQUOCTHINH/smart-garden-dashboard.git
