@@ -8,35 +8,13 @@
 
 <br>
 
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/58b7dbe4-033b-41d2-bda7-c21b9eeb07b3" width="1726" alt="Auto mode UI">
-  <br><br>
-  <em>Auto Mode Control UI for local web server and public web server</em>
-</div>
+| ![Auto Mode UI](https://github.com/user-attachments/assets/58b7dbe4-033b-41d2-bda7-c21b9eeb07b3) | ![Manual Mode UI](https://github.com/user-attachments/assets/9b28d8a6-a34f-4c09-be08-ad872b96eed0) |
+|:--:|:--:|
+| **Auto Mode Control UI**<br>| **Manual Mode Control UI**<br>|
 
-<br>
-
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/9b28d8a6-a34f-4c09-be08-ad872b96eed0" width="1681" alt="manual mode UI">
-  <br><br>
-  <em>Manual Control UI for local web server and public web server</em>
-</div>
-
-<br>
-
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/4a6d4efa-c265-4310-9897-9f805a4c42df" width="1681" alt="manual mode UI">
-  <br><br>
-  <em>Setting UI for local web server and public web server</em>
-</div>
-
-<br>
-
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/1e680ec3-7964-4551-b896-5947488b85ef" width="1681" alt="manual mode UI">
-  <br><br>
-  <em>User manual on local web server and public web server</em>
-</div>
+| ![Setting Mode UI](https://github.com/user-attachments/assets/4a6d4efa-c265-4310-9897-9f805a4c42df) | ![Manual Mode UI](https://github.com/user-attachments/assets/1e680ec3-7964-4551-b896-5947488b85ef) |
+|:--:|:--:|
+| **Setting Mode UI**<br>| **User Manual UI**<br>|
 
 ## Overview
 
