@@ -7,13 +7,21 @@
 #include "freertos/semphr.h" 
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_crt_bundle.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+// #include "cJSON.h"
+#include "STAmode.h"
 
 static const char *TAG = "STAMode";
 #define NVS_NAMESPACE "storage"
 #define NVS_KEY_CONFIG "auto_cfg_v2" // Đổi key để tránh xung đột struct cũ
+
+#define MQTT_TOPIC_DATA "smartgarden/device/001/telemetry"
+#define MQTT_TOPIC_CMD  "smartgarden/device/001/cmd"
+/* NEW: Topic dành riêng để sync cấu hình */
+#define MQTT_TOPIC_CONF "smartgarden/device/001/config"
 
 /* --- Global Data Storage --- */
 typedef struct {
@@ -49,11 +57,13 @@ static auto_config_t s_auto_config = {
 };
 
 extern QueueHandle_t device_queue; 
+extern QueueHandle_t update_queue; 
 
-typedef struct {
-    int command_id;
-    int value; 
-} device_control_t; 
+// typedef struct {
+//     int command_id;
+//     int value; 
+// } device_control_t; 
+
 
 /* --- EMBEDDED FILES --- */
 extern const uint8_t sta_index_html_start[] asm("_binary_sta_index_html_start");
@@ -65,6 +75,7 @@ extern const uint8_t logo_png_end[]         asm("_binary_sta_logoBK_png_end");
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static httpd_handle_t s_server = NULL; 
+extern QueueHandle_t network_queue;
 
 /* --- NVS HELPER FUNCTIONS --- */
 
@@ -97,29 +108,136 @@ static void load_config_nvs() {
     }
 }
 
+/* --- HELPER: Trigger Sync Config --- */
+void stamode_trigger_config_sync() {
+    if (network_queue) {
+        /* Sử dụng update_message_t chuẩn từ STAmode.h */
+        update_message_t msg;
+        msg.type = MSG_TYPE_CONFIG_JSON;
+        msg.data.config_json = NULL; // NULL = Trigger Sync (Không mang dữ liệu)
+        
+        if (xQueueSend(network_queue, &msg, 0) == pdTRUE) {
+            ESP_LOGI(TAG, "Triggered Config Sync to Network Task");
+        } else {
+            ESP_LOGW(TAG, "Network Queue Full, Config Sync skipped");
+        }
+    }
+}
+
+/* --- PUBLIC: Execute MQTT Publish (Được gọi bởi Network Task) --- */
+void stamode_mqtt_publish_config_now() {
+    if (s_mqtt_client) {
+        char json[300];
+        sprintf(json, "{\"te\":%d,\"tt\":%.1f,\"to\":%d,\"he\":%d,\"ht\":%.1f,\"ho\":%d,\"se\":%d,\"st\":%d,\"so\":%d}", 
+            s_auto_config.temp_en, s_auto_config.temp_thresh, s_auto_config.temp_op,
+            s_auto_config.hum_en, s_auto_config.hum_thresh, s_auto_config.hum_op,
+            s_auto_config.soil_en, s_auto_config.soil_thresh, s_auto_config.soil_op);
+        
+        esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_CONF, json, 0, 1, 1);
+        ESP_LOGI(TAG, "Config Synced to Cloud (Executed)");
+    }
+}
+
+/* Hàm hỗ trợ parse JSON settings từ MQTT (Thêm vào trước mqtt_event_handler) */
+void stamode_apply_config(const char *json_str) {
+    /* Ví dụ payload: {"command":"setConfig", "value":{"te":1,"tt":30.0,"to":1,...}} */
+    /* Lưu ý: Để đơn giản, ta sẽ parse thủ công bằng strstr/sscanf như các hàm trước 
+       hoặc dùng cJSON nếu project đã có component json */
+    
+    /* Parse thủ công đơn giản */
+    char *ptr;
+    if((ptr=strstr(json_str,"\"te\":"))) s_auto_config.temp_en=atoi(ptr+5);
+    if((ptr=strstr(json_str,"\"tt\":"))) s_auto_config.temp_thresh=atof(ptr+5);
+    if((ptr=strstr(json_str,"\"to\":"))) s_auto_config.temp_op=atoi(ptr+5);
+    
+    if((ptr=strstr(json_str,"\"he\":"))) s_auto_config.hum_en=atoi(ptr+5);
+    if((ptr=strstr(json_str,"\"ht\":"))) s_auto_config.hum_thresh=atof(ptr+5);
+    if((ptr=strstr(json_str,"\"ho\":"))) s_auto_config.hum_op=atoi(ptr+5);
+    
+    if((ptr=strstr(json_str,"\"se\":"))) s_auto_config.soil_en=atoi(ptr+5);
+    if((ptr=strstr(json_str,"\"st\":"))) s_auto_config.soil_thresh=atoi(ptr+5);
+    if((ptr=strstr(json_str,"\"so\":"))) s_auto_config.soil_op=atoi(ptr+5);
+    
+    save_config_nvs();
+    stamode_trigger_config_sync(); // Gửi tín hiệu sang Queue, Đồng bộ ngay sau khi lưu
+    ESP_LOGI(TAG, "Updated Config from MQTT");
+}
+
 /* --- MQTT Event Handler --- */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = event_data;
-    switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
-        esp_mqtt_client_subscribe(s_mqtt_client, "v1/devices/me/rpc/request/+", 0);
-        break;
-    case MQTT_EVENT_DATA:
-        if (device_queue) {
-            device_control_t cmd;
-            bool valid = false;
-            if (strstr(event->data, "setRelay")) {
-                cmd.command_id = (strstr(event->data, "true") || strstr(event->data, "1")) ? 1 : 0;
-                valid = true;
-            } else if (strstr(event->data, "setMode")) {
-                if (strstr(event->data, "manual")) cmd.command_id = 3;
-                else cmd.command_id = 2;
-                valid = true;
+    if (event_id == MQTT_EVENT_CONNECTED) {
+        ESP_LOGI(TAG, "MQTT Connected (TLS). Subscribing to %s", MQTT_TOPIC_CMD);
+        esp_mqtt_client_subscribe(s_mqtt_client, MQTT_TOPIC_CMD, 0);
+    }
+    else if (event_id == MQTT_EVENT_DATA) {
+        ESP_LOGI(TAG, "MQTT Recv: %d bytes", event->data_len);
+        ESP_LOGI(TAG, "MQTT CMD: %.*s", event->data_len, event->data);
+        
+        /* Copy toàn bộ data vào buffer để xử lý an toàn */
+        char *data_buf = malloc(event->data_len + 1);
+        if (data_buf) {
+            memcpy(data_buf, event->data, event->data_len);
+            data_buf[event->data_len] = '\0'; // Null-terminate
+
+            /* Xử lý Config */
+            if (strstr(data_buf, "setConfig")) {
+                if (update_queue) {
+                    update_message_t msg;
+                    msg.type = MSG_TYPE_CONFIG_JSON;
+                    /* data_buf đã được malloc, ta chuyển quyền sở hữu cho queue */
+                    /* NHƯNG vì update_queue nhận struct, ta cần gán pointer */
+                    /* Để tránh double free hoặc phức tạp, ta copy lại hoặc dùng luôn pointer này nếu thiết kế cho phép */
+                    /* Ở đây ta sẽ copy sang buffer mới cho message để đảm bảo clean ownership, 
+                       hoặc đơn giản hơn là dùng luôn data_buf làm config_json và KHÔNG free ở đây */
+                    
+                    /* Cách 1: Reuse data_buf (Hiệu quả nhất) */
+                    msg.data.config_json = data_buf; 
+                    if (xQueueSend(update_queue, &msg, 0) != pdTRUE) {
+                        free(data_buf); // Queue đầy, free ngay
+                        ESP_LOGE(TAG, "Update Queue full");
+                    } else {
+                        // Đã gửi thành công, task kia sẽ free data_buf
+                        data_buf = NULL; // Đánh dấu để không free ở cuối hàm
+                    }
+                } else {
+                    free(data_buf);
+                }
+            } 
+            /* Xử lý Device Control */
+            else if (device_queue) {
+                device_control_t cmd = {0}; 
+                bool cmd_found = false;
+
+                if (strstr(data_buf, "setRelay")) {
+                    cmd.command_id = (strstr(data_buf, "true") || strstr(data_buf, "1")) ? 1 : 0; 
+                    cmd_found = true;
+                } 
+                else if (strstr(data_buf, "setMode")) {
+                    cmd.command_id = strstr(data_buf, "manual") ? 3 : 2; 
+                    cmd_found = true;
+                }
+
+                if (cmd_found) {
+                    xQueueSend(device_queue, &cmd, 0);
+                }
+                
+                // Nếu data_buf chưa được chuyển cho update_queue, ta free nó
+                if (data_buf) free(data_buf);
+            } else {
+                if (data_buf) free(data_buf);
             }
-            if (valid) xQueueSend(device_queue, &cmd, 0);
+        } else {
+            ESP_LOGE(TAG, "Malloc failed in handler");
         }
-        break;
-    default: break;
+    }
+
+    else if (event_id == MQTT_EVENT_ERROR) {
+        ESP_LOGE(TAG, "MQTT Connection Error: %d", event->error_handle->error_type);
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+            ESP_LOGE(TAG, "TLS/SSL Error: 0x%x", event->error_handle->esp_tls_last_esp_err);
+            ESP_LOGE(TAG, "Socket Errno: %d", event->error_handle->esp_transport_sock_errno);
+        }
     }
 }
 
@@ -264,7 +382,9 @@ void stamode_publish_mqtt(float temp, float hum, int soil, int relay, int mode) 
         char payload[128];
         sprintf(payload, "{\"temperature\":%.1f,\"humidity\":%.1f,\"soil_moisture\":%d,\"relay\":%d,\"mode\":%d}", 
                 temp, hum, soil, relay, mode);
-        esp_mqtt_client_publish(s_mqtt_client, "v1/devices/me/telemetry", payload, 0, 1, 0);
+        esp_mqtt_client_publish(s_mqtt_client, MQTT_TOPIC_DATA, payload, 0, 1, 1);
+        ESP_LOGI(TAG, "Data published: T=%.1f H=%.1f S=%d R=%d", 
+                        temp, hum, soil, relay);
     }
 }
 
@@ -275,21 +395,25 @@ void stamode_stop(void) {
         ESP_LOGI(TAG, "STA Web Server Stopped");
     }
     if (s_mqtt_client) {
+        ESP_LOGI(TAG, "Stopping MQTT Client...");
         esp_mqtt_client_stop(s_mqtt_client);
         esp_mqtt_client_destroy(s_mqtt_client);
         s_mqtt_client = NULL;
-        ESP_LOGI(TAG, "MQTT Client Stopped");
+        ESP_LOGI(TAG, "MQTT Client Destroyed");
     }
 }
 
-void stamode_start(const char *broker_uri, int mqtt_port, const char *mqtt_token) {
+void stamode_start(const char *broker_url, int mqtt_port, const char *user, const char *pass) {
+    /* FIX: Đảm bảo clean state trước khi init mới */
+    stamode_stop();
+    
     load_config_nvs();
 
-    httpd_handle_t server = NULL;
+    // httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 12; 
 
-    if (httpd_start(&server, &config) == ESP_OK) {
+    if (httpd_start(&s_server, &config) == ESP_OK) {
         httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_handler };
         httpd_uri_t favicon = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler };
         httpd_uri_t logo = { .uri = "/logo.png", .method = HTTP_GET, .handler = logo_handler };
@@ -299,24 +423,30 @@ void stamode_start(const char *broker_uri, int mqtt_port, const char *mqtt_token
         httpd_uri_t api_rel = { .uri = "/api/relay/toggle", .method = HTTP_POST, .handler = relay_toggle_handler };
         httpd_uri_t api_mode = { .uri = "/api/control", .method = HTTP_POST, .handler = control_mode_handler };
         
-        httpd_register_uri_handler(server, &root);
-        httpd_register_uri_handler(server, &favicon);
-        httpd_register_uri_handler(server, &logo);
-        httpd_register_uri_handler(server, &api_sen);
-        httpd_register_uri_handler(server, &api_set_get);
-        httpd_register_uri_handler(server, &api_set_post);
-        httpd_register_uri_handler(server, &api_rel);
-        httpd_register_uri_handler(server, &api_mode);
+        httpd_register_uri_handler(s_server, &root);
+        httpd_register_uri_handler(s_server, &favicon);
+        httpd_register_uri_handler(s_server, &logo);
+        httpd_register_uri_handler(s_server, &api_sen);
+        httpd_register_uri_handler(s_server, &api_set_get);
+        httpd_register_uri_handler(s_server, &api_set_post);
+        httpd_register_uri_handler(s_server, &api_rel);
+        httpd_register_uri_handler(s_server, &api_mode);
         
         ESP_LOGI(TAG, "Local Dashboard started on Port 80");
     }
 
     char full_uri[128];
-    sprintf(full_uri, "mqtt://%s:%d", broker_uri, mqtt_port);
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = full_uri,
-        .credentials.username = mqtt_token,
+    sprintf(full_uri, "mqtts://%s:%d", broker_url, mqtt_port);
+
+    esp_mqtt_client_config_t mqtt_cfg = { 
+        .broker.address.uri = full_uri, 
+        .credentials.username = user,
+        .credentials.authentication.password = pass,
+        /* Quan trọng: Enable xác thực chứng chỉ SSL */
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
     };
+
+    ESP_LOGI(TAG, "Connecting to MQTT Broker: %s", full_uri);
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(s_mqtt_client);

@@ -55,7 +55,7 @@ static TaskHandle_t s_reconnect_task_handle = NULL;
 void start_provisioning_mode(void);
 void start_normal_mode(char *ssid, char *pass);
 static httpd_handle_t start_webserver(void);
-static void stop_webserver(httpd_handle_t server);
+static void stop_webserver(void);
 static void reconnect_timer_callback(TimerHandle_t xTimer);
 esp_err_t load_wifi_credentials(char *ssid, char *pass, size_t max_len);
 
@@ -110,6 +110,8 @@ static void reconnect_task(void *pvParameter) {
             }
         }
     }
+
+    vTaskDelete(NULL);
 }
 
 static void reconnect_timer_callback(TimerHandle_t xTimer) {
@@ -120,7 +122,7 @@ static void reconnect_timer_callback(TimerHandle_t xTimer) {
 
 /* --- Task: Switch to STA Mode --- */
 static void switch_to_sta_task(void *pvParameter) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(2000));
     ESP_LOGI(TAG, "Credentials saved. Switching to Station Mode (No Reboot)...");
     
     /* Load credentials we just saved (or use s_temp_*) */
@@ -176,6 +178,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                 /* Reset retry count and start provisioning */
                 s_retry_num = 0;
                 start_provisioning_mode();
+                //remember to remove to this call in a call back function because that may be can lead to a stack overflow
             }
         }
     } 
@@ -320,11 +323,11 @@ static httpd_handle_t start_webserver(void) {
     return NULL;
 }
 
-static void stop_webserver(httpd_handle_t server) {
-    if (server) {
-        httpd_stop(server);
+static void stop_webserver(void) {
+    if (s_server) {
+        httpd_stop(s_server);
         s_server = NULL;
-        ESP_LOGI(TAG, "Web Server Stopped");
+        ESP_LOGI(TAG, "AP Web Server Stopped");
     }
 }
 
@@ -334,6 +337,9 @@ void start_provisioning_mode(void) {
 
     /* FIX QUAN TRỌNG: Tắt Web Server & MQTT của STA Mode trước! */
     stamode_stop();
+
+    /* 2. Thêm Delay nhỏ để đảm bảo socket đã giải phóng */
+    // vTaskDelay(pdMS_TO_TICKS(500));
 
     s_is_provisioning = true; // FLAG: We are in AP Mode
 
@@ -377,14 +383,20 @@ void start_normal_mode(char *ssid, char *pass) {
     s_is_provisioning = false; // FLAG: We are in Normal Mode
 
     /* 1. Stop Web Server (Free up RAM) */
-    stop_webserver(s_server);
+    stop_webserver();
+
+    /* THÊM DELAY NHỎ: Để đảm bảo tài nguyên AP được giải phóng hoàn toàn trước khi bật STA full tải */
+    // vTaskDelay(pdMS_TO_TICKS(5000));
 
     /* 2. Stop WiFi to clear AP config */
     esp_wifi_stop();
     
     /* 3. Re-init for STA only */
+    /* CLEAN RESET: Stop -> Deinit -> Init */
+    esp_wifi_deinit(); // <-- QUAN TRỌNG: Xóa sạch cấu hình cũ
+    
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg)); // <-- Init mới hoàn toàn
 
     wifi_config_t sta_config = {0};
     strcpy((char *)sta_config.sta.ssid, ssid);

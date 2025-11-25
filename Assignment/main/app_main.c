@@ -18,46 +18,40 @@
 #include "stamode.h"
 
 /* --- CONFIGURATION --- */
-#define BASE_TICK_RATE_MS       1000    
+#define BASE_TICK_RATE_MS       1000  
+#define RELAY_CONTROL_INTERVAL  100  
 #define MQTT_PUBLISH_CYCLE      10      
 
 #define NETWORK_QUEUE_SIZE      20      
-#define DEVICE_QUEUE_SIZE       5       
+#define DEVICE_QUEUE_SIZE       10   
+#define UPDATE_QUEUE_SIZE       10    
 
 #define DHT11_PIN               GPIO_NUM_18
 #define SOIL_PIN                GPIO_NUM_1
 #define RELAY_PIN               GPIO_NUM_10
 #define LED_PIN                 GPIO_NUM_48
 
-#define MQTT_BROKER_HOST        "app.coreiot.io"
-#define MQTT_BROKER_PORT        1883
-#define ACCESS_TOKEN            "wszmzebjxp41b0c5ynvv"
+/* --- HIVEMQ CLOUD CONFIGURATION --- */
+/* Copy "Cluster URL" từ ảnh của bạn vào đây */
+#define MQTT_BROKER_HOST        "81f38e24654b4ee58fcd5ea11d164817.s1.eu.hivemq.cloud"
+#define MQTT_BROKER_PORT        8883  // Cổng SSL/TLS bắt buộc
+/* Nhập User/Pass bạn vừa tạo ở tab Access Management */
+#define MQTT_USERNAME           "smart-garden-test" 
+#define MQTT_PASSWORD           "LLQT2k4@"
+
 #define MDNS_HOSTNAME           "smartgarden" 
+
+/* Command IDs */
+#define CMD_RELAY_OFF   0
+#define CMD_RELAY_ON    1
+#define CMD_MODE_AUTO   2
+#define CMD_MODE_MANUAL 3
 
 static const char *TAG = "MAIN_APP";
 
-/* --- DATA STRUCTURES --- */
-typedef struct {
-    float temp;
-    float hum;
-    int soil;
-    int relay_state;
-    int mode; 
-} sensor_data_t;
-
-typedef struct {
-    int command_id; 
-} device_control_t;
-
-/* UPDATED IMPORT function */
-extern void stamode_get_config(int *t_en, float *t_th, int *t_op, 
-                               int *h_en, float *h_th, int *h_op, 
-                               int *s_en, int *s_th, int *s_op);
-extern void stamode_get_sensor_values(float *temp, float *hum, int *soil);
-
 QueueHandle_t network_queue = NULL; 
 QueueHandle_t device_queue = NULL;
-QueueHandle_t ui_queue = NULL;      
+QueueHandle_t update_queue = NULL;      
 
 static bool is_wifi_connected = false;
 static bool is_manual_mode = false;
@@ -110,15 +104,15 @@ void relay_control_task(void *pvParameters) {
     while (1) {
         relay_toggle(LED_PIN); 
 
-        bool cmd_received = xQueueReceive(device_queue, &cmd, pdMS_TO_TICKS(BASE_TICK_RATE_MS));
+        bool cmd_received = xQueueReceive(device_queue, &cmd, pdMS_TO_TICKS(RELAY_CONTROL_INTERVAL));
         bool state_changed = false;
 
         if (cmd_received == pdTRUE) {
             ESP_LOGI(TAG, "CMD Received Immediate: %d", cmd.command_id);
-            if (cmd.command_id == 2) { is_manual_mode = false; state_changed = true; }      
-            else if (cmd.command_id == 3) { is_manual_mode = true; state_changed = true; }  
-            else if (cmd.command_id == 1) { is_manual_mode = true; relay_on(RELAY_PIN); state_changed = true; }
-            else if (cmd.command_id == 0) { is_manual_mode = true; relay_off(RELAY_PIN); state_changed = true; }
+            if (cmd.command_id == CMD_MODE_AUTO) { is_manual_mode = false; state_changed = true; }      
+            else if (cmd.command_id == CMD_MODE_MANUAL) { is_manual_mode = true; state_changed = true; }  
+            else if (cmd.command_id == CMD_RELAY_ON) { is_manual_mode = true; relay_on(RELAY_PIN); state_changed = true; }
+            else if (cmd.command_id == CMD_RELAY_OFF) { is_manual_mode = true; relay_off(RELAY_PIN); state_changed = true; }
         }
         
         /* UPDATED: LOGIC AUTO THÔNG MINH HƠN */
@@ -153,11 +147,28 @@ void relay_control_task(void *pvParameters) {
         }
         
         if (state_changed) {
-            int current_relay = (relay_get_state(RELAY_PIN) == RELAY_ON) ? 1 : 0;
-            int current_mode = is_manual_mode ? 1 : 0;
-            stamode_update_relay_status_http(current_relay, current_mode);
+            // int current_relay = (relay_get_state(RELAY_PIN) == RELAY_ON) ? 1 : 0;
+            // int current_mode = is_manual_mode ? 1 : 0;
+            stamode_update_relay_status_http((relay_get_state(RELAY_PIN) == RELAY_ON), is_manual_mode);
+
+            /* OPTIMIZED: Gửi thông điệp vào Network Queue thay vì gửi trực tiếp */
+            // Lấy giá trị cảm biến hiện tại từ bộ nhớ đệm
+            stamode_get_sensor_values(&cur_temp, &cur_hum, &cur_soil);
+            
+            update_message_t net_msg;
+            net_msg.type = MSG_TYPE_SENSOR_DATA;
+            net_msg.data.sensor.temp = cur_temp;
+            net_msg.data.sensor.hum = cur_hum;
+            net_msg.data.sensor.soil = cur_soil;
+            net_msg.data.sensor.relay_state = (relay_get_state(RELAY_PIN) == RELAY_ON);
+            net_msg.data.sensor.mode = is_manual_mode;
+            
+            // Gửi vào queue với timeout = 0 (không chờ nếu queue đầy)
+            xQueueSend(network_queue, &net_msg, 0);
         }
     }
+
+    vTaskDelete(NULL);
 }
 
 /* --- TASK 2: SENSOR READING (Core 1) --- */
@@ -173,54 +184,120 @@ void sensor_telemetry_task(void *pvParameters) {
         int mode_st = is_manual_mode ? 1 : 0;
 
         if (dht.temperature != -1) {
-            sensor_data_t packet = { .temp=dht.temperature, .hum=dht.humidity, .soil=soil, .relay_state=relay_st, .mode=mode_st };
             
-            xQueueOverwrite(ui_queue, &packet);
+            /* Gửi Sensor Data vào UPDATE QUEUE */
+            update_message_t msg;
+            msg.type = MSG_TYPE_SENSOR_DATA;
+            msg.data.sensor.temp = dht.temperature;
+            msg.data.sensor.hum = dht.humidity;
+            msg.data.sensor.soil = soil;
+            msg.data.sensor.relay_state = relay_st;
+            msg.data.sensor.mode = mode_st;
 
-            mqtt_counter++;
-            if (mqtt_counter >= MQTT_PUBLISH_CYCLE) {
-                if (xQueueSend(network_queue, &packet, 0) != pdTRUE) {
-                    sensor_data_t dum; xQueueReceive(network_queue, &dum, 0);
-                    xQueueSend(network_queue, &packet, 0);
+            xQueueSend(update_queue, &msg, 0);
+
+            /* FIX: Logic update rate theo Mode */
+            bool should_send_mqtt = false;
+            
+            if (is_manual_mode) {
+                // Manual Mode: Gửi mỗi 1 giây (mỗi chu kỳ)
+                should_send_mqtt = true;
+                mqtt_counter = 0; // Reset counter để khi chuyển sang Auto nó đếm lại từ đầu
+            } else {
+                // Auto Mode: Gửi mỗi 10 giây
+                mqtt_counter++;
+                if (mqtt_counter >= MQTT_PUBLISH_CYCLE) {
+                    should_send_mqtt = true;
+                    mqtt_counter = 0;
                 }
-                mqtt_counter = 0; 
+            }
+
+            if (should_send_mqtt) {
+                /* Gửi vào Network Queue: Dùng luôn struct msg vừa tạo */
+                /* Vì msg.type = MSG_TYPE_SENSOR_DATA nên Network Task sẽ hiểu là gửi data */
+                if (xQueueSend(network_queue, &msg, 0) != pdTRUE) {
+                    update_message_t dum;
+                    xQueueReceive(network_queue, &dum, 0); 
+                    xQueueSend(network_queue, &msg, 0);
+                    ESP_LOGW(TAG, "Network Queue Full. Dropped Oldest.");
+                }
             }
         }
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(BASE_TICK_RATE_MS));
     }
+
+    vTaskDelete(NULL);
 }
 
-/* --- TASK 3: UI UPDATE (Core 0) --- */
-void ui_update_task(void *pvParameters) {
-    sensor_data_t packet;
+/* --- TASK 3: HTTP UI UPDATE and Update setting following user desire (Core 0) --- */
+void update_task(void *pvParameters) {
+    update_message_t msg;
+    
     while (1) {
-        if (xQueueReceive(ui_queue, &packet, portMAX_DELAY) == pdTRUE) {
-            stamode_update_http_data(packet.temp, packet.hum, packet.soil, packet.relay_state, packet.mode);
+        /* Chờ tin nhắn từ queue */
+        if (xQueueReceive(update_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            
+            if (msg.type == MSG_TYPE_SENSOR_DATA) {
+                // 1. Cập nhật dữ liệu cảm biến cho Local Web
+                stamode_update_http_data(msg.data.sensor.temp, 
+                                         msg.data.sensor.hum, 
+                                         msg.data.sensor.soil, 
+                                         msg.data.sensor.relay_state, 
+                                         msg.data.sensor.mode);
+            } 
+            else if (msg.type == MSG_TYPE_CONFIG_JSON) {
+                // 2. Xử lý Config từ MQTT (Nhiệm vụ mới)
+                if (msg.data.config_json) {
+                    ESP_LOGI(TAG, "Update Task: Applying Config from MQTT...");
+                    stamode_apply_config(msg.data.config_json);
+                    free(msg.data.config_json); // GIẢI PHÓNG BỘ NHỚ SAU KHI DÙNG
+                }
+            }
         }
     }
+
+    vTaskDelete(NULL);
 }
 
 /* --- TASK 4: NETWORK MANAGER (Core 0) --- */
 void network_task(void *pvParameters) {
-    sensor_data_t packet;
     apmode_init();
+    update_message_t net_msg;
 
     while (1) {
         if (xSemaphoreTake(wifi_connected_sem, 0) == pdTRUE) {
             if (!is_stamode_services_started) {
                 ESP_LOGI(TAG, "Starting STA Mode Services...");
-                stamode_start(MQTT_BROKER_HOST, MQTT_BROKER_PORT, ACCESS_TOKEN);
+                stamode_start(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_USERNAME, MQTT_PASSWORD);
                 is_stamode_services_started = true;
             }
         }
 
         if (is_wifi_connected) {
-            if (xQueueReceive(network_queue, &packet, pdMS_TO_TICKS(100)) == pdTRUE) {
-                stamode_publish_mqtt(packet.temp, packet.hum, packet.soil, packet.relay_state, packet.mode);
+            if (xQueueReceive(network_queue, &net_msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+                /* Xử lý dựa trên MSG_TYPE chuẩn */
+                switch (net_msg.type) {
+                    case MSG_TYPE_SENSOR_DATA:
+                        stamode_publish_mqtt(net_msg.data.sensor.temp, 
+                                             net_msg.data.sensor.hum, 
+                                             net_msg.data.sensor.soil, 
+                                             net_msg.data.sensor.relay_state, 
+                                             net_msg.data.sensor.mode);
+                        break;
+                        
+                    case MSG_TYPE_CONFIG_JSON:
+                        /* QUY ƯỚC: Nếu nhận loại này ở Network Queue, nghĩa là TRIGGER SYNC CONFIG */
+                        /* Không cần quan tâm payload bên trong, chỉ cần gọi hàm publish config */
+                        ESP_LOGI(TAG, "Network Task: TRIGGER SYNC received -> Publishing Config...");
+                        stamode_mqtt_publish_config_now();
+                        break;
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100)); 
     }
+
+    vTaskDelete(NULL);
 }
 
 void app_main(void) {
@@ -240,15 +317,15 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &system_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &system_event_handler, NULL, NULL));
 
-    network_queue = xQueueCreate(NETWORK_QUEUE_SIZE, sizeof(sensor_data_t));
+    network_queue = xQueueCreate(NETWORK_QUEUE_SIZE, sizeof(update_message_t));
     device_queue = xQueueCreate(DEVICE_QUEUE_SIZE, sizeof(device_control_t));
-    ui_queue = xQueueCreate(1, sizeof(sensor_data_t));
+    update_queue = xQueueCreate(UPDATE_QUEUE_SIZE, sizeof(update_message_t));
 
     if (soil_sensor_init(SOIL_PIN) != ESP_OK) ESP_LOGE(TAG, "Soil Sensor Init Failed");
 
     xTaskCreatePinnedToCore(sensor_telemetry_task, "telemetry", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(relay_control_task, "relay_ctrl", 4096, NULL, 6, NULL, 1);
-    xTaskCreatePinnedToCore(ui_update_task, "ui_update", 3072, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(update_task, "ui_update", 4096, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(network_task, "network", 4096, NULL, 10, NULL, 0);
     
     ESP_LOGI(TAG, "System Initialized.");
