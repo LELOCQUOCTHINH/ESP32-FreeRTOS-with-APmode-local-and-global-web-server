@@ -2,6 +2,14 @@
 
 This module manages **Station Mode (STA)** for the ESP32. It handles Wi-Fi connection, runs a **local Web Server** for monitoring & control, and maintains an **MQTT** connection for telemetry and remote commands.
 
+| ![Auto Mode UI](https://github.com/user-attachments/assets/f8fa2395-068e-4c14-bd90-90730276096c) | ![Manual Mode UI](https://github.com/user-attachments/assets/5450d8c7-1009-408e-9d96-23b1b3a48fdc) |
+|:--:|:--:|
+| **Auto Mode Control UI**<br>| **Manual Mode Control UI**<br>|
+
+| ![Setting Mode UI](https://github.com/user-attachments/assets/cace7abe-7ec2-4c50-85a0-eb3a0c8a9310) | ![Manual Mode UI](https://github.com/user-attachments/assets/2c7a3772-25bb-43f1-96e6-0ad8410a246b) |
+|:--:|:--:|
+| **Setting Mode UI**<br>| **User Manual UI**<br>|
+
 ## Directory Structure
 
 ```
