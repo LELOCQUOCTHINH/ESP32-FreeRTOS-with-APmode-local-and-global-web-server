@@ -24,8 +24,9 @@ components/APmode/
 ├── CMakeLists.txt         # Build config & asset embedding
 ├── apmode.c               # Core logic (state machine, WiFi events, NVS)
 ├── index.html             # Web UI
-├── favicon-32x32.png      # Tab icon
-├── logoBK.png             # Branding logo
+├── images/
+│   └── favicon-32x32.png   # Favicon (embedded)
+|   └── logoBK.png         # Logo (embedded)
 ├── README.md              # This file
 └── include/
     └── apmode.h           # Public API header
