@@ -309,6 +309,7 @@ static esp_err_t settings_post_handler(httpd_req_t *req) {
 
     save_config_nvs();
     httpd_resp_send(req, "OK", 2);
+    stamode_trigger_config_sync();
     return ESP_OK;
 }
 
@@ -408,6 +409,8 @@ void stamode_start(const char *broker_url, int mqtt_port, const char *user, cons
     stamode_stop();
     
     load_config_nvs();
+
+    stamode_trigger_config_sync();
 
     // httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
